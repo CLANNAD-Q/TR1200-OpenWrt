@@ -1,5 +1,9 @@
 # TR1200-OpenWrt
 
+![TR1200 OpenWrt 刷写成功](docs/images/tr1200-openwrt-success.png)
+
+刷写完成后的 Cudy TR1200 v1 已运行 OpenWrt 24.10.5，并启用 Argon 主题和简体中文界面。
+
 ## TR1200 刷机工具
 
 `tr1200_flasher.py` 面向 **Cudy TR1200 v1（R46）**。它只使用 Python 标准库和系统自带的 `scp`/`ssh`，不会直接写入 SPI/MTD 分区。
