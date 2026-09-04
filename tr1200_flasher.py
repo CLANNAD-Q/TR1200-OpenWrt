@@ -11,22 +11,28 @@ The tool deliberately does not write raw MTD/SPI partitions. It supports:
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
+import hmac
 import http.server
+import http.cookiejar
 import json
+import os
 import pathlib
 import re
+import secrets
+import shlex
 import socket
 import subprocess
 import sys
 import threading
 import time
-import http.cookiejar
 import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
 from dataclasses import dataclass
+from typing import Callable
 
 
 DEFAULT_RELEASE = "24.10.5"
@@ -34,15 +40,64 @@ DEFAULT_TARGET = "ramips/mt76x8"
 DEFAULT_DEVICE = "cudy_tr1200-v1"
 DOWNLOAD_ROOT = "https://downloads.openwrt.org/releases"
 STOCK_DRIVE_ID = "1vqg9GMi3LVF6viG7gSDZf6XwlsD88kX_"
-THEME_FILENAME = "luci-theme-openwrt-2020_26.228.65014~8e278ba_all.ipk"
-THEME_SHA256 = "fa514b2df92363e253d5798de7242527db71cc5fcfd638ba7e4af588b52d061e"
 ARGON_FILENAME = "luci-theme-argon_2.4.7_all.ipk"
 ARGON_URL = "https://github.com/jerrykuku/luci-theme-argon/releases/download/v2.4.7/luci-theme-argon_2.4.7_all.ipk"
 ARGON_SHA256 = "d0a5d0992f1e13094c89c29f46868a6bba79cdd644a0b4b606088267cb2e8e59"
-ZH_FILENAME = "luci-i18n-base-zh-cn_26.228.65014~8e278ba_all.ipk"
-ZH_SHA256 = "37a7131888fed872e55b38cd26c97ade9012efe50624db552ef487b6666d91d0"
+ZH_PACKAGE = "luci-i18n-base-zh-cn"
 WEB_HOST = "127.0.0.1"
 WEB_PORT = 8765
+MAX_CONTENT_LENGTH = 1024 * 1024
+
+SSH_CMD = os.environ.get("TR1200_SSH", "ssh")
+SCP_CMD = os.environ.get("TR1200_SCP", "scp")
+CURL_CMD = os.environ.get("TR1200_CURL", "curl")
+SSH_KEYGEN_CMD = os.environ.get("TR1200_SSH_KEYGEN", "ssh-keygen")
+KNOWN_HOSTS = pathlib.Path(
+    os.environ.get("TR1200_KNOWN_HOSTS", str(pathlib.Path.home() / ".ssh" / "known_hosts"))
+).expanduser()
+
+
+def ensure_known_hosts_dir() -> None:
+    try:
+        KNOWN_HOSTS.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise FlasherError(f"无法创建 SSH known_hosts 目录：{exc}") from exc
+
+
+def ssh_options() -> list[str]:
+    ensure_known_hosts_dir()
+    return [
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=8",
+        "-o",
+        "ConnectionAttempts=1",
+        "-o",
+        f"UserKnownHostsFile={KNOWN_HOSTS}",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+    ]
+
+
+def remove_known_host(host: str, port: int) -> str | None:
+    if not KNOWN_HOSTS.is_file():
+        return None
+    target = host if port == 22 else f"[{host}]:{port}"
+    try:
+        result = subprocess.run(
+            [SSH_KEYGEN_CMD, "-R", target, "-f", str(KNOWN_HOSTS)],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"无法清理旧 SSH 主机指纹，请在重启后手动运行 ssh-keygen -R {target}：{exc}"
+    if result.returncode not in (0, 1):
+        detail = result.stderr.strip() or f"ssh-keygen exited with code {result.returncode}"
+        return f"无法清理旧 SSH 主机指纹，请在重启后手动运行 ssh-keygen -R {target}：{detail}"
+    return None
 
 
 class FlasherError(RuntimeError):
@@ -54,6 +109,13 @@ class ImageInfo:
     kind: str
     filename: str
     url: str
+
+
+@dataclass(frozen=True)
+class PackageInfo:
+    filename: str
+    url: str
+    sha256: str
 
 
 class WebState:
@@ -142,20 +204,90 @@ pre{background:#10151c;color:#d1f7d6;padding:14px;border-radius:8px;min-height:1
 <div class="card"><div class="row"><h2 style="margin-right:auto">实时日志</h2><button onclick="copyLogs()">复制日志</button><span id="copyResult" class="muted"></span></div><pre id="logs">等待操作…</pre></div>
 <script>
 const $=id=>document.getElementById(id);
-async function call(path,options){const r=await fetch(path,options);const j=await r.json();if(!r.ok)throw Error(j.error||"请求失败");return j}
+const apiToken=__TR1200_TOKEN__;
+async function call(path,options={}){
+  const request={...options,headers:{...(options.headers||{})}};
+  if((request.method||"GET").toUpperCase()!=="GET"){request.headers["X-TR1200-Token"]=apiToken}
+  const r=await fetch(path,request);
+  let j;
+  try{j=await r.json()}catch(e){throw Error("服务返回了无效响应（HTTP "+r.status+"）")}
+  if(!r.ok)throw Error(j.error||"请求失败");
+  return j
+}
 function stageChanged(){return}
-async function detect(){ $("detectResult").textContent="检测中…"; try{const j=await call("/api/detect?host="+encodeURIComponent($("host").value));$("detectResult").innerHTML=j.reachable?'<span class="ok">已发现可刷写设备</span>：'+j.details:(j.details.includes("HTTP")?'<span class="warn">已发现设备，但当前阶段不能执行 SSH 刷写</span>：'+j.details:'<span class="bad">未发现服务</span>：'+j.details)}catch(e){$("detectResult").textContent=e.message}}
+async function detect(){ $("detectResult").textContent="检测中…";const fallback=$("stageLabel").dataset.stage==="stock"?"192.168.10.1":"192.168.1.1";try{const j=await call("/api/detect?host="+encodeURIComponent($("host").value||fallback));$("detectResult").textContent=(j.reachable?"已发现可刷写设备：":(j.details.includes("HTTP")?"已发现设备，但当前阶段不能执行 SSH 刷写：":"未发现服务："))+j.details}catch(e){$("detectResult").textContent=e.message}}
 async function downloadImage(){ $("imageResult").textContent="下载和校验中…"; try{await call("/api/download",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({release:$("release").value})});$("imageResult").textContent="后台下载和校验中，请查看进度与日志…"}catch(e){$("imageResult").textContent=e.message}}
 async function downloadStock(){ $("imageResult").textContent="下载 Cudy 中间固件中…"; try{const j=await call("/api/stock-download",{method:"POST"});$("imageResult").textContent="后台下载中，完成后自动出现在文件选择框…"}catch(e){$("imageResult").textContent=e.message}}
 async function installTheme(){ $("themeResult").textContent="后台下载、校验和安装中…"; try{await call("/api/theme-install",{method:"POST"});$("themeResult").textContent="已提交安装，请查看日志"}catch(e){$("themeResult").textContent=e.message}}
 async function flash(){const stage=$("stageLabel").dataset.stage;if(stage==="stock"){if(!$("password").value){alert("请填写管理员密码；默认是 admin，不是 Wi-Fi 密码");return}if(!confirm("确认自动登录原厂固件并上传已下载的中间固件？"))return;$("flash").disabled=true;try{await call("/api/stock-flash",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({host:$("host").value,password:$("password").value})})}catch(e){alert(e.message);$("flash").disabled=false}return} if(stage!=="openwrt"){alert("尚未检测到可用设备");return} if(!confirm("确认将中间 OpenWrt 升级为正式 OpenWrt？\\n工具会保留正确的 TR1200 v1 兼容检查。"))return; $("flash").disabled=true;try{await call("/api/flash",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({host:$("host").value,image:$("image").value,keep_settings:$("keep").checked})})}catch(e){alert(e.message);$("flash").disabled=false}}
 async function copyLogs(){const text=$("logs").textContent||"";try{await navigator.clipboard.writeText(text);$("copyResult").textContent="已复制"}catch(e){const area=document.createElement("textarea");area.value=text;document.body.appendChild(area);area.select();document.execCommand("copy");area.remove();$("copyResult").textContent="已复制"}setTimeout(()=>{$("copyResult").textContent=""},1800)}
-async function refresh(){try{const j=await call("/api/status");$("fill").style.width=j.progress+"%";$("phase").textContent=j.error?"失败："+j.error:(j.busy?j.phase+" ("+j.progress+"%)":"空闲");$("logs").textContent=j.logs.join("\\n")||"等待操作…";if(j.sysupgrade_image&&!$("image").value){$("image").value=j.sysupgrade_image} if(j.stock_image){$("stockStatus").innerHTML='<span class="ok">中间固件已下载</span>：'+j.stock_image;$("imageResult").innerHTML='<span class="ok">中间固件已下载</span>：'+j.stock_image}else if(!j.busy&&j.error){$("stockStatus").innerHTML='<span class="bad">下载失败</span>';$("imageResult").innerHTML='<span class="bad">中间固件未下载</span>：'+j.error}else if(!j.busy){$("stockStatus").textContent="中间固件未下载";$("imageResult").textContent="中间固件未下载；点击下载按钮获取"} if(j.stage){$("stageLabel").value=j.stage_label;$("stageLabel").dataset.stage=j.stage;$("host").value=j.host;$("passwordRow").style.display=j.stage==="stock"?"flex":"none";$("stageHint").textContent=j.stage_hint;$("flashHint").textContent=j.flash_hint;$("flash").textContent=j.stage==="stock"?"自动上传中间固件":"开始 sysupgrade";$("flashCard").style.display=j.complete?"none":"block"} $("flash").disabled=j.stage==="offline"||j.busy||(j.stage==="openwrt"&&!$("image").value.trim())||(j.stage==="stock"&&!j.stock_image||j.complete)}catch(e){}}
+async function refresh(){
+  try{
+    const j = await call("/api/status");
+    $("fill").style.width = j.progress + "%";
+    $("phase").textContent = j.error ? "失败：" + j.error : (j.busy ? j.phase + " (" + j.progress + "%)" : "空闲");
+    $("logs").textContent = j.logs.join("\n") || "等待操作…";
+    if (j.sysupgrade_image && !$("image").value) { $("image").value = j.sysupgrade_image }
+    if (j.stock_image) {
+       $("stockStatus").textContent = "中间固件已下载：" + j.stock_image;
+       $("imageResult").textContent = "中间固件已下载：" + j.stock_image;
+    } else if (!j.busy && j.error) {
+       $("stockStatus").textContent = "下载失败";
+       $("imageResult").textContent = "中间固件未下载：" + j.error;
+    } else if (!j.busy) {
+       $("stockStatus").textContent = "中间固件未下载";
+       $("imageResult").textContent = "中间固件未下载；点击下载按钮获取";
+    }
+    if (j.stage) {
+       $("stageLabel").value = j.stage_label;
+       $("stageLabel").dataset.stage = j.stage;
+       $("host").value = j.host;
+       $("passwordRow").style.display = j.stage === "stock" ? "flex" : "none";
+       $("stageHint").textContent = j.stage_hint;
+       $("flashHint").textContent = j.flash_hint;
+       $("flash").textContent = j.stage === "stock" ? "自动上传中间固件" : "开始 sysupgrade";
+       $("flashCard").style.display = j.complete ? "none" : "block";
+    }
+    $("flash").disabled = j.stage === "offline" || j.busy || (j.stage === "openwrt" && !$("image").value.trim()) || (j.stage === "stock" && !j.stock_image || j.complete);
+  } catch (e) {
+    $("logs").textContent = e.message || String(e);
+    $("phase").textContent = "错误：" + (e.message || String(e));
+  }
+}
 setInterval(refresh,700);refresh();
 </script></main></body></html>"""
 
 
+def validate_release(release: str) -> str:
+    if not isinstance(release, str) or not release:
+        raise FlasherError("Release is empty")
+    if len(release) > 32:
+        raise FlasherError("Invalid release: too long")
+    if not re.fullmatch(r"\d{2}\.\d{2}\.\d+", release):
+        raise FlasherError("Invalid release format; expected like 24.10.5")
+    return release
+
+
+def parse_release_from_image_filename(filename: str, kind: str) -> str:
+    suffixes = {
+        "sysupgrade": "squashfs-sysupgrade.bin",
+        "initramfs": "squashfs-initramfs-kernel.bin",
+    }
+    suffix = suffixes.get(kind)
+    if suffix is None:
+        raise FlasherError("Invalid image kind")
+    prefix = "openwrt-"
+    tail = f"-{DEFAULT_TARGET.replace('/', '-')}-{DEFAULT_DEVICE}-{suffix}"
+    if not filename.startswith(prefix) or not filename.endswith(tail):
+        raise FlasherError(f"Image filename is not an official {DEFAULT_DEVICE} {kind} image")
+    release = validate_release(filename[len(prefix):-len(tail)])
+    if filename != image_info(release, kind).filename:
+        raise FlasherError(f"Image filename is not an official {DEFAULT_DEVICE} {kind} image")
+    return release
+
+
 def image_info(release: str, kind: str) -> ImageInfo:
+    release = validate_release(release)
     if kind == "sysupgrade":
         suffix = "squashfs-sysupgrade.bin"
     elif kind == "initramfs":
@@ -165,6 +297,36 @@ def image_info(release: str, kind: str) -> ImageInfo:
     filename = f"openwrt-{release}-{DEFAULT_TARGET.replace('/', '-')}-{DEFAULT_DEVICE}-{suffix}"
     url = f"{DOWNLOAD_ROOT}/{release}/targets/{DEFAULT_TARGET}/{filename}"
     return ImageInfo(kind, filename, url)
+
+
+def expected_checksum(checksums: str, filename: str) -> str:
+    for line in checksums.splitlines():
+        fields = line.split()
+        if len(fields) != 2:
+            continue
+        listed_name = fields[1].lstrip("*")
+        if listed_name == filename and re.fullmatch(r"[0-9a-fA-F]{64}", fields[0]):
+            return fields[0].lower()
+    raise FlasherError(f"{filename} is not listed in the official checksum manifest")
+
+
+def official_image_checksum(release: str, filename: str) -> str:
+    checksum_url = f"{DOWNLOAD_ROOT}/{release}/targets/{DEFAULT_TARGET}/sha256sums"
+    checksums = fetch(checksum_url).decode("utf-8", errors="strict")
+    try:
+        return expected_checksum(checksums, filename)
+    except FlasherError as exc:
+        raise FlasherError(f"{exc} ({checksum_url})") from exc
+
+
+def verify_sysupgrade_image(image: pathlib.Path) -> str:
+    if not image.is_file():
+        raise FlasherError(f"Image does not exist: {image}")
+    release = parse_release_from_image_filename(image.name, "sysupgrade")
+    expected = official_image_checksum(release, image.name)
+    if not hmac.compare_digest(sha256(image).lower(), expected):
+        raise FlasherError("sysupgrade 镜像 SHA-256 校验失败，拒绝刷写")
+    return release
 
 
 def sha256(path: pathlib.Path) -> str:
@@ -184,42 +346,46 @@ def fetch(url: str) -> bytes:
         raise FlasherError(f"Download failed for {url}: {exc}") from exc
 
 
+def atomic_write(path: pathlib.Path, content: bytes) -> None:
+    temp = path.with_name(f".{path.name}.{secrets.token_hex(6)}.part")
+    try:
+        temp.write_bytes(content)
+        temp.replace(path)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
 def download_verified(info: ImageInfo, output_dir: pathlib.Path) -> pathlib.Path:
+    output_dir = output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    destination = output_dir / info.filename
+    destination = output_dir / pathlib.PurePath(info.filename).name
     print(f"Downloading {info.url}")
     image = fetch(info.url)
-    checksum_url = f"{info.url.rsplit('/', 1)[0]}/sha256sums"
-    checksums = fetch(checksum_url).decode("utf-8", errors="replace")
-    expected = None
-    for line in checksums.splitlines():
-        fields = line.split()
-        if len(fields) >= 2 and pathlib.PurePath(fields[-1].lstrip("*")).name == info.filename:
-            expected = fields[0]
-            break
-    if expected is None:
-        raise FlasherError(f"{info.filename} is not listed in {checksum_url}")
+    release = parse_release_from_image_filename(info.filename, info.kind)
+    expected = official_image_checksum(release, info.filename)
     actual = hashlib.sha256(image).hexdigest()
-    if actual.lower() != expected.lower():
+    if not hmac.compare_digest(actual.lower(), expected):
         raise FlasherError(f"SHA-256 mismatch: expected {expected}, got {actual}")
-    destination.write_bytes(image)
+    atomic_write(destination, image)
     print(f"Saved and verified: {destination} ({actual})")
     return destination
 
 
 def download_stock_intermediate(output_dir: pathlib.Path) -> pathlib.Path:
+    output_dir = output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     destination = output_dir / "TR1200-OpenWRT-Flash.bin"
-    archive = output_dir / "TR1200 V1.zip"
     urls = (
         f"https://drive.google.com/uc?export=download&id={STOCK_DRIVE_ID}",
         f"https://drive.usercontent.google.com/download?id={STOCK_DRIVE_ID}&export=download&confirm=t",
     )
     last_error: Exception | None = None
     for url in urls:
+        archive = output_dir / f".TR1200-V1.{secrets.token_hex(6)}.download.zip"
+        valid_archive = False
         try:
             result = subprocess.run(
-                ["curl.exe", "-L", "--fail", "--max-time", "120", "-A", "Mozilla/5.0", "-o", str(archive), url],
+                [CURL_CMD, "-L", "--fail", "--max-time", "120", "-A", "Mozilla/5.0", "-o", str(archive), url],
                 capture_output=True,
                 text=True,
                 check=False,
@@ -228,9 +394,13 @@ def download_stock_intermediate(output_dir: pathlib.Path) -> pathlib.Path:
                 raise FlasherError(result.stderr.strip() or f"curl exited with code {result.returncode}")
             with zipfile.ZipFile(archive):
                 pass
+            valid_archive = True
             break
         except (FlasherError, zipfile.BadZipFile) as exc:
             last_error = exc
+        finally:
+            if not valid_archive and archive.exists():
+                archive.unlink(missing_ok=True)
     else:
         raise FlasherError(f"无法下载 Cudy 官方中间固件：{last_error}")
     try:
@@ -238,81 +408,90 @@ def download_stock_intermediate(output_dir: pathlib.Path) -> pathlib.Path:
             member = next((name for name in bundle.namelist() if pathlib.PurePath(name).name == destination.name), None)
             if member is None:
                 raise FlasherError("官方压缩包中未找到 TR1200-OpenWRT-Flash.bin")
-            destination.write_bytes(bundle.read(member))
+            atomic_write(destination, bundle.read(member))
     except zipfile.BadZipFile as exc:
         raise FlasherError("中间固件下载结果不是有效 ZIP 文件，请检查网络后重试") from exc
     archive.unlink(missing_ok=True)
     return destination
 
 
-def download_theme(output_dir: pathlib.Path) -> pathlib.Path:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    path = output_dir / THEME_FILENAME
-    url = f"{DOWNLOAD_ROOT}/24.10.5/packages/mipsel_24kc/luci/{THEME_FILENAME}"
-    path.write_bytes(fetch(url))
-    if sha256(path).lower() != THEME_SHA256:
-        path.unlink(missing_ok=True)
-        raise FlasherError("LuCI 主题 SHA-256 校验失败")
+def release_package_info(release: str, package_name: str) -> PackageInfo:
+    release = validate_release(release)
+    package_root = f"{DOWNLOAD_ROOT}/{release}/packages/mipsel_24kc/luci"
+    packages_gz = fetch(f"{package_root}/Packages.gz")
+    try:
+        packages = gzip.decompress(packages_gz).decode("utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise FlasherError(f"OpenWrt {release} package index is invalid") from exc
+    for record in packages.split("\n\n"):
+        fields: dict[str, str] = {}
+        for line in record.splitlines():
+            key, separator, value = line.partition(": ")
+            if separator:
+                fields[key] = value
+        if fields.get("Package") != package_name:
+            continue
+        filename = fields.get("Filename", "")
+        checksum = fields.get("SHA256sum", "").lower()
+        if (
+            pathlib.PurePosixPath(filename).name != filename
+            or not re.fullmatch(rf"{re.escape(package_name)}_[A-Za-z0-9.+~:-]+_[A-Za-z0-9]+\.ipk", filename)
+        ):
+            raise FlasherError(f"OpenWrt package index contains an unsafe filename for {package_name}")
+        if not re.fullmatch(r"[0-9a-f]{64}", checksum):
+            raise FlasherError(f"OpenWrt package index lacks a valid checksum for {package_name}")
+        return PackageInfo(filename, f"{package_root}/{filename}", checksum)
+    raise FlasherError(f"OpenWrt {release} does not publish package {package_name}")
+
+
+def download_package(info: PackageInfo, output_dir: pathlib.Path) -> pathlib.Path:
+    path = output_dir / info.filename
+    if path.is_file() and hmac.compare_digest(sha256(path).lower(), info.sha256):
+        return path
+    content = fetch(info.url)
+    actual = hashlib.sha256(content).hexdigest()
+    if not hmac.compare_digest(actual, info.sha256):
+        raise FlasherError(f"{info.filename} SHA-256 校验失败")
+    atomic_write(path, content)
     return path
 
 
-def install_theme(host: str, package: pathlib.Path) -> None:
-    remote = f"/tmp/{package.name}"
-    common = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "StrictHostKeyChecking=no"]
-    result = subprocess.run(
-        ["scp.exe", *common, "-O", str(package), f"root@{host}:{remote}"],
-        capture_output=True, text=True, timeout=120, check=False,
-    )
-    if result.returncode:
-        raise FlasherError(f"主题上传失败：{result.stderr.strip()}")
-    command = f"opkg install {remote} && uci set luci.main.mediaurlbase='/luci-static/openwrt2020' && uci commit luci && rm -f {remote}"
-    result = subprocess.run(
-        ["ssh.exe", *common, f"root@{host}", command],
-        capture_output=True, text=True, timeout=60, check=False,
-    )
-    if result.returncode:
-        raise FlasherError(f"主题安装失败：{result.stderr.strip()}")
-
-
-def prepare_postflash_packages(output_dir: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
+def prepare_postflash_packages(output_dir: pathlib.Path, release: str) -> tuple[pathlib.Path, pathlib.Path]:
+    release = validate_release(release)
+    output_dir = output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     argon = output_dir / ARGON_FILENAME
     if not argon.is_file() or sha256(argon).lower() != ARGON_SHA256:
-        result = subprocess.run(
-            ["curl.exe", "-L", "--fail", "--max-time", "60", "-o", str(argon), ARGON_URL],
-            capture_output=True, text=True, check=False,
-        )
-        if result.returncode:
-            raise FlasherError(f"Argon 下载失败：{result.stderr.strip()}")
-    if sha256(argon).lower() != ARGON_SHA256:
+        content = fetch(ARGON_URL)
+        if not hmac.compare_digest(hashlib.sha256(content).hexdigest(), ARGON_SHA256):
+            raise FlasherError("Argon 主题 SHA-256 校验失败")
+        atomic_write(argon, content)
+    if not hmac.compare_digest(sha256(argon).lower(), ARGON_SHA256):
         raise FlasherError("Argon 主题 SHA-256 校验失败")
-    zh = output_dir / ZH_FILENAME
-    if not zh.is_file():
-        url = f"{DOWNLOAD_ROOT}/24.10.5/packages/mipsel_24kc/luci/{ZH_FILENAME}"
-        zh.write_bytes(fetch(url))
-    if sha256(zh).lower() != ZH_SHA256:
-        raise FlasherError("简体中文语言包 SHA-256 校验失败")
+    zh = download_package(release_package_info(release, ZH_PACKAGE), output_dir)
     return argon, zh
 
 
-def install_postflash_packages(host: str, output_dir: pathlib.Path) -> None:
-    argon, zh = prepare_postflash_packages(output_dir)
-    common = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "StrictHostKeyChecking=no"]
+def install_postflash_packages(host: str, output_dir: pathlib.Path, release: str) -> None:
+    argon, zh = prepare_postflash_packages(output_dir, release)
+    ssh_opts = ssh_options()
     for package in (argon, zh):
         result = subprocess.run(
-            ["scp.exe", *common, "-O", str(package), f"root@{host}:/tmp/{package.name}"],
+            [SCP_CMD, *ssh_opts, "-O", "-P", "22", str(package), f"root@{host}:/tmp/{package.name}"],
             capture_output=True, text=True, timeout=120, check=False,
         )
         if result.returncode:
             raise FlasherError(f"上传 {package.name} 失败：{result.stderr.strip()}")
+    remote_argon = shlex.quote("/tmp/" + argon.name)
+    remote_zh = shlex.quote("/tmp/" + zh.name)
     command = (
-        f"opkg install /tmp/{argon.name} /tmp/{zh.name} && "
+        f"opkg install {remote_argon} {remote_zh} && "
         "uci set luci.main.mediaurlbase='/luci-static/argon' && "
         "uci set luci.main.lang='zh_cn' && uci commit luci && "
-        f"rm -f /tmp/{argon.name} /tmp/{zh.name}"
+        f"rm -f {remote_argon} {remote_zh}"
     )
     result = subprocess.run(
-        ["ssh.exe", *common, f"root@{host}", command],
+        [SSH_CMD, *ssh_opts, "-p", "22", f"root@{host}", command],
         capture_output=True, text=True, timeout=90, check=False,
     )
     if result.returncode:
@@ -330,7 +509,10 @@ def install_theme_job(job: WebState) -> None:
         with job.lock:
             job.phase, job.progress = "下载并安装 Argon + 中文", 20
         job.log("开始下载、校验并安装 Argon 主题和简体中文")
-        install_postflash_packages("192.168.1.1", pathlib.Path("images"))
+        release_data = board.get("release")
+        release = str(release_data.get("version", "")) if isinstance(release_data, dict) else ""
+        release = validate_release(release)
+        install_postflash_packages("192.168.1.1", pathlib.Path("images"), release)
         with job.lock:
             job.phase, job.progress = "主题配置完成", 100
         job.log("Argon 主题和简体中文已启用")
@@ -344,7 +526,13 @@ def install_theme_job(job: WebState) -> None:
 
 
 def serve_tftp(directory: pathlib.Path, host: str, port: int) -> None:
-    """Serve recovery.bin over a minimal read-only TFTP server."""
+    """Serve recovery.bin over a more robust read-only TFTP server.
+
+    Implements basic RFC1350 behavior: responds to RRQ with a separate transfer
+    socket/TID, enforces client address/port, retries on timeout, and handles
+    16-bit block rollover. Only 'octet' mode and the filename 'recovery.bin'
+    are accepted.
+    """
     import socket
 
     root = directory.resolve()
@@ -355,26 +543,76 @@ def serve_tftp(directory: pathlib.Path, host: str, port: int) -> None:
     server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     server.bind((host, port))
     print(f"TFTP serving {image} on {host}:{port}. Press Ctrl+C to stop.")
+
+    def _tftp_transfer(client_addr: tuple[str, int], image_path: pathlib.Path) -> None:
+        trans = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            trans.bind((host, 0))
+            trans.settimeout(4.0)
+            block_num = 1
+            with image_path.open("rb") as fh:
+                while True:
+                    data = fh.read(512)
+                    packet = b"\x00\x03" + (block_num & 0xFFFF).to_bytes(2, "big") + data
+                    retries = 0
+                    while retries < 5:
+                        trans.sendto(packet, client_addr)
+                        try:
+                            resp, addr = trans.recvfrom(516)
+                        except socket.timeout:
+                            retries += 1
+                            continue
+                        # enforce same client address/port (TID)
+                        if addr != client_addr:
+                            # ignore packets from other hosts
+                            continue
+                        if len(resp) < 4:
+                            continue
+                        if resp[:2] == b"\x00\x04":  # ACK
+                            ack_block = int.from_bytes(resp[2:4], "big")
+                            if ack_block == (block_num & 0xFFFF):
+                                break
+                            else:
+                                # duplicate/old ACK, keep waiting
+                                continue
+                        if resp[:2] == b"\x00\x05":  # ERROR
+                            return
+                        # ignore unexpected packets
+                    else:
+                        print("TFTP transfer aborted: too many retries")
+                        return
+                    # If last data block (<512), transfer completes after its ACK
+                    if len(data) < 512:
+                        return
+                    block_num = (block_num + 1) & 0xFFFF
+        finally:
+            trans.close()
+
     try:
         while True:
             packet, address = server.recvfrom(2048)
-            if len(packet) < 4 or packet[:2] != b"\x00\x01":
+            if len(packet) < 4:
                 continue
-            filename = packet[2:].split(b"\x00", 1)[0].decode("ascii", errors="ignore")
-            if pathlib.PurePath(filename).name != "recovery.bin":
+            opcode = packet[:2]
+            if opcode != b"\x00\x01":  # not RRQ
                 continue
-            block_size = 512
-            with image.open("rb") as stream:
-                block = 1
-                while True:
-                    data = stream.read(block_size)
-                    server.sendto(b"\x00\x03" + block.to_bytes(2, "big") + data, address)
-                    response, _ = server.recvfrom(2048)
-                    if response[:2] != b"\x00\x04":
-                        raise FlasherError("Unexpected TFTP response")
-                    if len(data) < block_size:
-                        break
-                    block = (block + 1) & 0xFFFF
+            parts = packet[2:].split(b"\x00")
+            if not parts:
+                continue
+            filename = parts[0].decode("ascii", errors="ignore")
+            mode = parts[1].decode("ascii", errors="ignore").lower() if len(parts) > 1 and parts[1] else "octet"
+            if filename != "recovery.bin":
+                server.sendto(
+                    b"\x00\x05" + (1).to_bytes(2, "big") + b"Invalid filename\x00",
+                    address,
+                )
+                continue
+            if mode != "octet":
+                # reply with error packet (only octet supported)
+                server.sendto(b"\x00\x05" + (0).to_bytes(2, "big") + b"Only octet mode supported\x00", address)
+                continue
+            # spawn a thread to handle this transfer using a new TID (socket)
+            threading.Thread(target=_tftp_transfer, args=(address, image), daemon=True).start()
     except KeyboardInterrupt:
         print("\nTFTP server stopped.")
     finally:
@@ -382,9 +620,16 @@ def serve_tftp(directory: pathlib.Path, host: str, port: int) -> None:
 
 
 def prepare_recovery(image: pathlib.Path, output_dir: pathlib.Path) -> pathlib.Path:
+    if not image.is_file():
+        raise FlasherError(f"Image does not exist: {image}")
+    release = parse_release_from_image_filename(image.name, "initramfs")
+    expected = official_image_checksum(release, image.name)
+    if not hmac.compare_digest(sha256(image).lower(), expected):
+        raise FlasherError("initramfs 镜像 SHA-256 校验失败，拒绝准备 recovery.bin")
+    output_dir = output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     recovery = output_dir / "recovery.bin"
-    recovery.write_bytes(image.read_bytes())
+    atomic_write(recovery, image.read_bytes())
     print(f"Prepared {recovery}; configure the router's U-Boot TFTP request to recovery.bin.")
     return recovery
 
@@ -395,55 +640,54 @@ def ssh_upgrade(
     image: pathlib.Path,
     port: int,
     keep_settings: bool,
-    force_known_tr1200_variant: bool = False,
+    force_sysupgrade: bool = False,
 ) -> None:
-    if not image.is_file():
-        raise FlasherError(f"Image does not exist: {image}")
-    if DEFAULT_DEVICE not in image.name or "squashfs-sysupgrade.bin" not in image.name:
-        raise FlasherError(
-            f"{image.name} is not a verified {DEFAULT_DEVICE} sysupgrade image; "
-            "use the download command to obtain the matching image"
-        )
-    if image.name.startswith("openwrt-24.10.5-"):
-        expected_hash = "a9115119724afa5c4b83721772316f9d6d3ebbb7fa0614714846d5cb446f4728"
-        if sha256(image).lower() != expected_hash:
-            raise FlasherError("sysupgrade 镜像 SHA-256 校验失败，拒绝刷写")
+    verify_sysupgrade_image(image)
     remote = f"/tmp/{image.name}"
     ssh_target = f"{user}@{host}"
-    common = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ConnectionAttempts=1", "-o", "StrictHostKeyChecking=no"]
-    scp = ["scp", *common, "-O", "-P", str(port), str(image), f"{ssh_target}:{remote}"]
-    ssh = ["ssh", *common, "-p", str(port), ssh_target, "sysupgrade"]
+    ssh_opts = ssh_options()
+    scp_cmd = [SCP_CMD, *ssh_opts, "-O", "-P", str(port), str(image), f"{ssh_target}:{remote}"]
+    ssh_cmd = [SSH_CMD, *ssh_opts, "-p", str(port), ssh_target, "sysupgrade"]
     if not keep_settings:
-        ssh.append("-n")
-    if force_known_tr1200_variant:
-        ssh.append("-F")
-    ssh.append(remote)
+        ssh_cmd.append("-n")
+    if force_sysupgrade:
+        ssh_cmd.append("-F")
+    ssh_cmd.append(remote)
+
     print(f"Uploading {image} to {ssh_target}:{remote}")
     try:
-        result = subprocess.run(scp, check=False, timeout=120, capture_output=True, text=True)
+        result = subprocess.run(scp_cmd, check=False, timeout=120, capture_output=True, text=True)
         if result.returncode:
             detail = result.stderr.strip() or f"scp exited with code {result.returncode}"
             raise FlasherError(f"SCP 上传失败：{detail}")
     except subprocess.TimeoutExpired as exc:
         raise FlasherError("SCP 上传超时；请确认 SSH 已启用且 root 登录不需要交互式密码") from exc
     print("Starting sysupgrade; do not remove power or Ethernet.")
+    upgrade_started = False
     try:
-        result = subprocess.run(ssh, check=False, timeout=30, capture_output=True, text=True)
-        if result.returncode:
-            output = "\n".join(part for part in (result.stdout, result.stderr) if part).strip()
-            if "Commencing upgrade" in output or "Closing all shell sessions" in output:
-                print("sysupgrade started; the router closed SSH as expected.")
-                return
+        result = subprocess.run(ssh_cmd, check=False, timeout=30, capture_output=True, text=True)
+        output = "\n".join(part for part in (result.stdout, result.stderr) if part).strip()
+        if result.returncode == 0:
+            upgrade_started = True
+        elif "Commencing upgrade" in output or "Closing all shell sessions" in output:
+            upgrade_started = True
+            print("sysupgrade started; the router closed SSH as expected.")
+        else:
             detail = output or f"ssh exited with code {result.returncode}"
             raise FlasherError(f"sysupgrade 执行失败：{detail}")
     except subprocess.TimeoutExpired as exc:
         raise FlasherError("sysupgrade 命令超时；请检查路由器 SSH 状态") from exc
+    finally:
+        if upgrade_started:
+            warning = remove_known_host(host, port)
+            if warning:
+                print(f"Warning: {warning}", file=sys.stderr)
 
 
 def remote_board_info(host: str) -> dict[str, object]:
+    ssh_opts = ssh_options()
     result = subprocess.run(
-        ["ssh.exe", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "StrictHostKeyChecking=no",
-         f"root@{host}", "ubus", "call", "system", "board"],
+        [SSH_CMD, *ssh_opts, f"root@{host}", "ubus", "call", "system", "board"],
         capture_output=True,
         text=True,
         timeout=12,
@@ -458,7 +702,18 @@ def remote_board_info(host: str) -> dict[str, object]:
 
 
 def _hidden_fields(html: str) -> dict[str, str]:
-    return dict(re.findall(r'<input[^>]+type=["\']hidden["\'][^>]+name=["\']([^"\']+)["\'][^>]+value=["\']([^"\']*)', html, re.I))
+    fields: dict[str, str] = {}
+    for tag in re.findall(r"<input\b[^>]*>", html, re.I | re.S):
+        attributes = {
+            key.lower(): value
+            for key, value in re.findall(
+                r"""([a-zA-Z_:][\w:.-]*)\s*=\s*["']([^"']*)["']""",
+                tag,
+            )
+        }
+        if attributes.get("type", "").lower() == "hidden" and attributes.get("name"):
+            fields[attributes["name"]] = attributes.get("value", "")
+    return fields
 
 
 def _multipart(fields: dict[str, str], file_field: str, filename: str, content: bytes) -> tuple[bytes, str]:
@@ -475,7 +730,7 @@ def _multipart(fields: dict[str, str], file_field: str, filename: str, content: 
     return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
 
 
-def stock_upgrade(host: str, password: str, image: pathlib.Path, progress: callable) -> None:
+def stock_upgrade(host: str, password: str, image: pathlib.Path, progress: Callable[[int, str], None]) -> None:
     if not image.is_file() or image.name != "TR1200-OpenWRT-Flash.bin":
         raise FlasherError("请选择文件名必须为 TR1200-OpenWRT-Flash.bin 的官方中间固件")
     base = f"http://{host}"
@@ -576,9 +831,9 @@ def stock_upgrade(host: str, password: str, image: pathlib.Path, progress: calla
     form_attributes, form_content = form_match.groups()
     action_match = re.search(r'\baction=["\']([^"\']+)["\']', form_attributes, re.I)
     file_match = re.search(r'<input\b(?=[^>]*\btype=["\']file["\'])(?=[^>]*\bname=["\']([^"\']+)["\'])[^>]*>', form_content, re.I | re.S)
-    if not action_match or not file_match:
+    if not file_match:
         raise FlasherError("未找到原厂固件上传表单，设备固件界面可能不同")
-    action = urllib.parse.urljoin(flash_url, action_match.group(1))
+    action = urllib.parse.urljoin(flash_url, action_match.group(1)) if action_match else flash_url
     upload_fields = _hidden_fields(form_content)
     file_field = file_match.group(1)
     upload_fields.update({
@@ -628,7 +883,7 @@ def detect_workflow() -> dict[str, object]:
                 label = "OpenWrt 中间固件（23.05.3）"
             elif version:
                 label = f"刷写已完成：正式 OpenWrt（{version}）"
-        except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        except (FlasherError, OSError, subprocess.SubprocessError, json.JSONDecodeError):
             pass
         return {"stage": "openwrt", "label": label, "host": "192.168.1.1", "ssh": True, "board_name": board_name, "complete": version not in ("", "23.05.3")}
     if openwrt_http:
@@ -693,6 +948,7 @@ def run_web(host: str, port: int) -> None:
     if host not in ("127.0.0.1", "localhost"):
         raise FlasherError("网页刷机服务只允许监听本机地址（127.0.0.1）")
     state = WebState()
+    token = secrets.token_urlsafe(32)
     def refresh_workflow() -> None:
         while True:
             try:
@@ -715,21 +971,29 @@ def run_web(host: str, port: int) -> None:
             self.wfile.write(body)
 
         def do_GET(self) -> None:
-            if self.path == "/":
-                body = WEB_PAGE.encode("utf-8")
+            from urllib.parse import urlparse, parse_qs
+            parsed = urlparse(self.path)
+            path = parsed.path
+            if path == "/":
+                page = WEB_PAGE.replace("__TR1200_TOKEN__", json.dumps(token))
+                body = page.encode("utf-8")
                 self.send_response(200)
+                self.send_header("Cache-Control", "no-store")
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
                 return
-            if self.path == "/api/status":
+            if path == "/api/status":
                 self.send_json(state.snapshot())
                 return
-            if self.path.startswith("/api/detect"):
-                from urllib.parse import parse_qs, urlparse
-                query = parse_qs(urlparse(self.path).query)
+            if path == "/api/detect":
+                query = parse_qs(parsed.query)
                 target = query.get("host", ["192.168.1.1"])[0]
+                # only allow the two expected probe targets
+                if target not in ("192.168.10.1", "192.168.1.1"):
+                    self.send_json({"error": "检测主机被拒绝"}, 400)
+                    return
                 reachable, details = router_probe(target)
                 state.log(("发现路由器：" if reachable else "未发现路由器：") + details)
                 self.send_json({"reachable": reachable, "details": details})
@@ -737,10 +1001,33 @@ def run_web(host: str, port: int) -> None:
             self.send_json({"error": "Not found"}, 404)
 
         def do_POST(self) -> None:
-            if self.path not in ("/api/download", "/api/flash", "/api/stock-flash", "/api/stock-download", "/api/theme-install"):
+            from urllib.parse import urlparse
+            parsed = urlparse(self.path)
+            path = parsed.path
+            allowed = ("/api/download", "/api/flash", "/api/stock-flash", "/api/stock-download", "/api/theme-install")
+            if path not in allowed:
                 self.send_json({"error": "Not found"}, 404)
                 return
-            if self.path == "/api/theme-install":
+            hdr_token = self.headers.get("X-TR1200-Token")
+            if hdr_token is None or not hmac.compare_digest(hdr_token, token):
+                self.send_json({"error": "Missing or invalid token"}, 403)
+                return
+            origin = self.headers.get("Origin")
+            if origin is not None and origin not in (f"http://{host}:{port}", f"http://localhost:{port}"):
+                self.send_json({"error": "请求来源被拒绝"}, 403)
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                self.send_json({"error": "Content-Length 无效"}, 400)
+                return
+            if length < 0:
+                self.send_json({"error": "Content-Length 无效"}, 400)
+                return
+            if length > MAX_CONTENT_LENGTH:
+                self.send_json({"error": "Payload too large"}, 413)
+                return
+            if path == "/api/theme-install":
                 with state.lock:
                     if state.busy:
                         self.send_json({"error": "已有任务正在运行"}, 409)
@@ -749,7 +1036,7 @@ def run_web(host: str, port: int) -> None:
                 threading.Thread(target=install_theme_job, args=(state,), daemon=True).start()
                 self.send_json({"started": True})
                 return
-            if self.path == "/api/stock-download":
+            if path == "/api/stock-download":
                 with state.lock:
                     if state.busy:
                         self.send_json({"error": "已有任务正在运行"}, 409)
@@ -759,8 +1046,7 @@ def run_web(host: str, port: int) -> None:
                 thread.start()
                 self.send_json({"started": True})
                 return
-            length = int(self.headers.get("Content-Length", "0"))
-            if self.path == "/api/stock-flash":
+            if path == "/api/stock-flash":
                 content_type = self.headers.get("Content-Type", "")
                 if "application/json" not in content_type:
                     self.send_json({"error": "请先下载官方中间固件"}, 400)
@@ -770,8 +1056,14 @@ def run_web(host: str, port: int) -> None:
                 except json.JSONDecodeError:
                     self.send_json({"error": "请求 JSON 无效"}, 400)
                     return
-                host_value = str(fields.get("host", "192.168.10.1"))
-                password_value = str(fields.get("password", ""))
+                if not isinstance(fields, dict):
+                    self.send_json({"error": "请求 JSON 顶层必须为对象"}, 400)
+                    return
+                host_value = fields.get("host", "192.168.10.1")
+                password_value = fields.get("password", "")
+                if not isinstance(host_value, str) or not isinstance(password_value, str):
+                    self.send_json({"error": "host 和 password 必须是字符串"}, 400)
+                    return
                 upload_path = pathlib.Path("images") / "TR1200-OpenWRT-Flash.bin"
                 if host_value != "192.168.10.1":
                     self.send_json({"error": "原厂阶段只允许连接 192.168.10.1"}, 400)
@@ -795,23 +1087,45 @@ def run_web(host: str, port: int) -> None:
                 thread.start()
                 self.send_json({"started": True})
                 return
+            content_type = self.headers.get("Content-Type", "")
+            if "application/json" not in content_type:
+                self.send_json({"error": "Content-Type 必须为 application/json"}, 415)
+                return
             try:
                 payload = json.loads(self.rfile.read(length) or b"{}")
             except json.JSONDecodeError:
                 self.send_json({"error": "请求 JSON 无效"}, 400)
                 return
-            if self.path == "/api/download":
-                release = str(payload.get("release", DEFAULT_RELEASE))
+            if not isinstance(payload, dict):
+                self.send_json({"error": "请求 JSON 顶层必须为对象"}, 400)
+                return
+            if path == "/api/download":
+                release = payload.get("release", DEFAULT_RELEASE)
+                if not isinstance(release, str):
+                    self.send_json({"error": "release 必须是字符串"}, 400)
+                    return
+                try:
+                    release = validate_release(release)
+                except Exception as exc:
+                    self.send_json({"error": str(exc)}, 400)
+                    return
                 thread = threading.Thread(target=download_job, args=(state, release), daemon=True)
             else:
-                image = pathlib.Path(str(payload.get("image", ""))).resolve()
-                target = str(payload.get("host", "192.168.1.1"))
+                image_value = payload.get("image", "")
+                target = payload.get("host", "192.168.1.1")
+                if not isinstance(image_value, str) or not isinstance(target, str):
+                    self.send_json({"error": "image 和 host 必须是字符串"}, 400)
+                    return
+                image = pathlib.Path(image_value).resolve()
                 if target != "192.168.1.1":
                     self.send_json({"error": "只允许操作当前检测到的 192.168.1.1"}, 400)
                     return
                 images_root = pathlib.Path("images").resolve()
                 if images_root not in image.parents:
                     self.send_json({"error": "镜像必须来自本工具 images 文件夹"}, 400)
+                    return
+                if "keep_settings" in payload and not isinstance(payload.get("keep_settings"), bool):
+                    self.send_json({"error": "keep_settings 必须是布尔值"}, 400)
                     return
                 keep = bool(payload.get("keep_settings", False))
                 thread = threading.Thread(target=flash_job, args=(state, target, image, keep), daemon=True)
@@ -878,12 +1192,9 @@ def run_web(host: str, port: int) -> None:
             model = str(board.get("model", ""))
             if model != "Cudy TR1200" or board_name not in ("cudy,tr1200", "cudy,tr1200-v1"):
                 raise FlasherError(f"设备不匹配：model={model or '未知'} board={board_name or '未知'}")
-            known_variant = board_name == "cudy,tr1200"
             with job.lock:
                 job.phase, job.progress = "上传镜像", 20
-            if known_variant:
-                job.log("检测到官方中间固件的已知标识差异，将启用 TR1200 v1 兼容检查")
-            ssh_upgrade(target, "root", image, 22, keep, force_known_tr1200_variant=known_variant)
+            ssh_upgrade(target, "root", image, 22, keep, force_sysupgrade=(board_name == "cudy,tr1200"))
             with job.lock:
                 job.phase, job.progress = "sysupgrade 已启动，等待重启", 70
             job.log("sysupgrade 已开始；SSH 断开是正常现象，开始监控设备重启")
@@ -891,7 +1202,8 @@ def run_web(host: str, port: int) -> None:
             with job.lock:
                 job.phase, job.progress = "配置 Argon 和简体中文", 92
             job.log("正式 OpenWrt 已恢复，开始安装 Argon 主题和简体中文")
-            install_postflash_packages("192.168.1.1", pathlib.Path("images"))
+            release = parse_release_from_image_filename(image.name, "sysupgrade")
+            install_postflash_packages("192.168.1.1", pathlib.Path("images"), release)
             with job.lock:
                 job.phase, job.progress = "刷写与主题配置完成", 100
             job.log("Argon 主题和简体中文已启用，刷新 http://192.168.1.1/ 即可")

@@ -8,6 +8,12 @@
 
 `tr1200_flasher.py` 面向 **Cudy TR1200 v1（R46）**。它只使用 Python 标准库和系统自带的 `scp`/`ssh`，不会直接写入 SPI/MTD 分区。
 
+注意（Windows）: 该工具需要 Python 3.10+、Windows OpenSSH（`ssh`、`scp`、`ssh-keygen`）和 `curl`。可通过环境变量 `TR1200_SSH`、`TR1200_SCP`、`TR1200_SSH_KEYGEN`、`TR1200_CURL` 指定命令。工具默认使用当前用户的 `~/.ssh/known_hosts`，也可通过 `TR1200_KNOWN_HOSTS` 指定路径。主机密钥策略为 `StrictHostKeyChecking=accept-new`：首次连接记录指纹，后续连接严格校验；sysupgrade 后会移除该地址的旧指纹，以便接受重装后生成的新密钥。
+
+安全与校验：该工具严格校验 OpenWrt release 格式（例如 `24.10.5`），并对下载或本地提供的 sysupgrade/initramfs 镜像执行官方 `sha256sums` 校验；拒绝无法验证或型号不匹配的文件。刷写后安装的中文包也从对应 release 的官方 `Packages.gz` 动态解析文件名和 SHA-256，避免跨版本混装。网页服务只监听本机，破坏性请求受每次启动随机令牌、来源校验、目标地址白名单和请求体大小限制保护。
+
+TFTP：内置只读服务遵循 RFC 1350 的基本行为：只允许请求 `recovery.bin` 的 octet 模式，RRQ 使用独立传输 socket/TID，校验客户端地址/端口，设置超时与有限重传，并处理重复 ACK 和 16 位 block rollover。连续超时 5 次会终止本次传输，可重新触发 U-Boot 下载。
+
 ### 网页操作界面
 
 启动本地网页控制台：
